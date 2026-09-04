@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+todos.db
+*.sqlite
+.venv/
