@@ -7,14 +7,26 @@ root-absolute (`/add`). That is what lets the same code work unchanged whether
 it is served at `http://localhost:8080/` or behind a path prefix at
 `https://your-tunnel/todo/`. See docs/base-path.md in the deployer for why
 that matters.
+
+Where the todos live
+--------------------
+* **No configuration:** a SQLite file beside the code, so `python main.py`
+  just works. Inside a container that file is lost when the container is
+  replaced.
+* **`DATABASE_URL=mysql://...`:** MySQL instead. Universal Local Deployer sets
+  this variable itself when a MySQL database is linked to the app, so the
+  todos then survive every redeploy.
 """
 
 from __future__ import annotations
 
+import contextlib
 import html
 import os
 import sqlite3
+import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -22,26 +34,101 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 # Kept beside the code so a bind-mounted volume can persist it later.
 DB_PATH = Path(os.environ.get("TODO_DB", "todos.db"))
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_MYSQL = DATABASE_URL.startswith("mysql://")
+
+SCHEMA_SQLITE = """
+    CREATE TABLE IF NOT EXISTS todos (
+        id    INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT    NOT NULL,
+        done  INTEGER NOT NULL DEFAULT 0
+    )
+"""
+
+SCHEMA_MYSQL = """
+    CREATE TABLE IF NOT EXISTS todos (
+        id    INT AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(200) NOT NULL,
+        done  TINYINT NOT NULL DEFAULT 0
+    ) CHARACTER SET utf8mb4
+"""
+
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+class Session:
+    """One connection, one way to run SQL — whichever database is behind it.
+
+    Statements are written once with `?` placeholders (SQLite's style); for
+    MySQL they are rewritten to `%s`. Rows come back indexable by column name
+    either way, so nothing else in this file cares which database it is.
+    """
+
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    def execute(self, sql: str, params: tuple = ()):
+        if USE_MYSQL:
+            cursor = self.connection.cursor()
+            cursor.execute(sql.replace("?", "%s"), params)
+            return cursor
+        return self.connection.execute(sql, params)
+
+
+def connect_mysql():
+    # Imported here so running without MySQL never needs the driver installed.
+    import pymysql
+    import pymysql.cursors
+
+    parts = urlsplit(DATABASE_URL)
+    return pymysql.connect(
+        host=parts.hostname,
+        port=parts.port or 3306,
+        user=unquote(parts.username or ""),
+        password=unquote(parts.password or ""),
+        database=parts.path.lstrip("/"),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=5,
+    )
+
+
+@contextlib.contextmanager
+def db():
+    """A session that commits on success, rolls back on error, always closes.
+
+    A connection per request is plenty for a todo list, and it means a database
+    restart heals itself: the next request simply connects again.
+    """
+    if USE_MYSQL:
+        connection = connect_mysql()
+    else:
+        connection = sqlite3.connect(DB_PATH)
+        connection.row_factory = sqlite3.Row
+    try:
+        yield Session(connection)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def init_db() -> None:
-    with db() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS todos (
-                id    INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT    NOT NULL,
-                done  INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
+    # The deployer only starts this container once the database answers, but a
+    # database can still be a moment slower than us after a restart — so try a
+    # few times before giving up loudly.
+    attempts = 10 if USE_MYSQL else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            with db() as session:
+                session.execute(SCHEMA_MYSQL if USE_MYSQL else SCHEMA_SQLITE)
+            return
+        except Exception:
+            if attempt == attempts:
+                raise
+            time.sleep(2)
 
 
 PAGE = """<!doctype html>
@@ -103,7 +190,7 @@ PAGE = """<!doctype html>
   {items}
 
   <footer>
-    <span>{remaining} left</span>
+    <span>{remaining} left &middot; stored in {storage}</span>
     <span>served by {hostname}</span>
   </footer>
 </main>
@@ -147,6 +234,7 @@ def render() -> str:
     return PAGE.format(
         items=items,
         remaining=sum(1 for row in rows if not row["done"]),
+        storage="MySQL" if USE_MYSQL else "SQLite (lost on redeploy)",
         hostname=html.escape(os.environ.get("HOSTNAME", "this machine")),
     )
 

@@ -28,6 +28,15 @@ root-absolute (`/add`). That is what lets the identical code work both at
 `http://localhost:8080/` and behind a path prefix at
 `https://your-tunnel/todo/`.
 
-Todos are stored in a SQLite file inside the container, so they are lost when
-the container is replaced. Set `TODO_DB` to a path on a mounted volume to keep
-them.
+## Where the todos are stored
+
+| Situation | Storage |
+|---|---|
+| Nothing configured (`python main.py`) | A SQLite file (`todos.db`, or the path in `TODO_DB`). Inside a container it is lost when the container is replaced. |
+| `DATABASE_URL=mysql://user:password@host:3306/db` | MySQL. The `todos` table is created on first start. |
+
+The page footer says which one is in use.
+
+With Universal Local Deployer you do not set `DATABASE_URL` yourself: create a
+MySQL database, open this app's **Databases** card, **Link** it, and redeploy.
+The variable is injected on every deploy, and the todos then survive redeploys.
